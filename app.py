@@ -1,117 +1,75 @@
 import streamlit as st
-import pymupdf4llm
 import os
-import numpy as np
-import faiss
-import ollama
+import pymupdf4llm
 from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+import httpx
 
-# Set page configuration for a professional wide layout
-st.set_page_config(page_title="Mozilla RAG Dashboard", layout="wide")
+st.set_page_config(page_title="Mozilla Lightweight RAG", page_icon="🤖", layout="wide")
+st.title(" Mozilla Lightweight RAG System")
+st.write("A completely local, privacy-preserving document intelligence application.")
 
-UPLOAD_DIR = "uploaded_docs"
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
+if "messages" not in st.session_state: st.session_state.messages = []
+if "vector_index" not in st.session_state: st.session_state.vector_index = None
+if "chunks" not in st.session_state: st.session_state.chunks = []
 
 @st.cache_resource
-def load_embedding_model():
+def load_embedding_model(): 
     return SentenceTransformer("all-MiniLM-L6-v2")
-
 embedding_model = load_embedding_model()
 
-def chunk_text(text, chunk_size=1000, chunk_overlap=200):
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - chunk_overlap
-    return chunks
+st.sidebar.header("📁 Document Ingestion")
+uploaded_file = st.sidebar.file_uploader("Upload your Reference PDF", type=["pdf"])
 
-# --- SIDEBAR DESIGN ---
-st.sidebar.title("??? Control Panel")
-st.sidebar.markdown("Use this panel to manage your input documents and monitor pipeline metrics.")
-uploaded_file = st.sidebar.file_uploader("Upload a PDF document:", type=["pdf"])
+if uploaded_file and st.session_state.vector_index is None:
+    temp_path = f"temp_{uploaded_file.name}"
+    with open(temp_path, "wb") as f: 
+        f.write(uploaded_file.getbuffer())
+    with st.spinner("Parsing and embedding document structures..."):
+        try:
+            md_text = pymupdf4llm.to_markdown(temp_path)
+            chunk_size, overlap = 1000, 200
+            chunks = [md_text[i:i+chunk_size] for i in range(0, len(md_text), chunk_size - overlap)]
+            st.session_state.chunks = chunks
+            embeddings = embedding_model.encode(chunks)
+            index = faiss.IndexFlatL2(embeddings.shape[1])
+            index.add(np.array(embeddings).astype("float32"))
+            st.session_state.vector_index = index
+            st.sidebar.success(f"Successfully processed {len(chunks)} chunks!")
+        except Exception as e: 
+            st.sidebar.error(f"Error: {e}")
+        finally:
+            if os.path.exists(temp_path): 
+                os.remove(temp_path)
 
-if "document_chunks" not in st.session_state:
-    st.session_state["document_chunks"] = None
-if "faiss_index" not in st.session_state:
-    st.session_state["faiss_index"] = None
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]): 
+        st.markdown(msg["content"])
 
-if uploaded_file is not None:
-    file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
+if user_query := st.chat_input("Ask a question about your uploaded document:"):
+    with st.chat_message("user"): 
+        st.markdown(user_query)
+    st.session_state.messages.append({"role": "user", "content": user_query})
     
-    if st.session_state["faiss_index"] is None:
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.read())
-        
-        with st.sidebar.spinner("Processing Document..."):
-            try:
-                md_text = pymupdf4llm.to_markdown(file_path)
-                chunks = chunk_text(md_text)
-                
-                embeddings = embedding_model.encode(chunks)
-                embeddings_array = np.array(embeddings).astype('float32')
-                
-                dimension = embeddings_array.shape[1]
-                index = faiss.IndexFlatL2(dimension)
-                index.add(embeddings_array)
-                
-                st.session_state["document_chunks"] = chunks
-                st.session_state["faiss_index"] = index
-                st.session_state["md_text_len"] = len(md_text)
-                
-            except Exception as e:
-                st.sidebar.error(f"Error parsing file: {e}")
-
-# --- MAIN SCREEN DESIGN ---
-st.title("?? Mozilla Lightweight RAG Application")
-st.subheader("Final Year Project Dashboard")
-st.markdown("This intelligent assistant parses local documents, creates dense vector representations, and handles semantic retrieval using an entirely offline pipeline.")
-
-if st.session_state["faiss_index"] is not None:
-    st.sidebar.success(f"Active File: {uploaded_file.name}")
-    
-    # Render Metrics cleanly inside the Sidebar
-    st.sidebar.markdown("### ?? Pipeline Metrics")
-    st.sidebar.metric("Characters Extracted", st.session_state["md_text_len"])
-    st.sidebar.metric("Total Vector Chunks", len(st.session_state["document_chunks"]))
-    st.sidebar.metric("FAISS Index Database", "Online / Ready")
-    
-    # Main Chat Interface
-    st.markdown("---")
-    st.markdown("### ?? Ask Questions to your Document")
-    user_query = st.text_input("Type your question below and press Enter:", placeholder="e.g., What are the core skills or projects listed?")
-    
-    if user_query:
-        with st.spinner("Analyzing semantic vectors and generating response..."):
-            query_vector = embedding_model.encode([user_query]).astype('float32')
-            distances, indices = st.session_state["faiss_index"].search(query_vector, k=1)
-            matched_index = indices[0][0]
-            retrieved_chunk = st.session_state["document_chunks"][matched_index]
-            
-            prompt_context = f"""
-            You are a helpful AI assistant. Answer the user's question accurately using ONLY the provided document context.
-            If the answer cannot be found in the context, politely say you don't know.
-            
-            Context:
-            {retrieved_chunk}
-            
-            Question: {user_query}
-            Answer:
-            """
-            
-            try:
-                response = ollama.generate(model="phi3", prompt=prompt_context)
-                
-                # Display nicely formatted response block
-                st.markdown("#### ?? AI Response")
-                st.info(response['response'])
-                
-                with st.expander("?? View Retrieved Source Context"):
-                    st.caption(f"Source Document Segment ID: {matched_index}")
-                    st.code(retrieved_chunk, language="markdown")
-            except Exception as ollama_error:
-                st.error(f"Could not connect to Ollama. Verify model 'phi3' is running via terminal! Error: {ollama_error}")
-else:
-    st.info("?? Please upload a PDF document in the left control panel to activate the RAG AI engine.")
+    if st.session_state.vector_index is None:
+        with st.chat_message("assistant"): 
+            st.warning("Please upload a PDF first.")
+    else:
+        with st.chat_message("assistant"):
+            with st.spinner("Searching and synthesizing answer..."):
+                query_vector = embedding_model.encode([user_query])
+                D, I = st.session_state.vector_index.search(np.array(query_vector).astype("float32"), k=3)
+                retrieved_context = "\n".join([st.session_state.chunks[idx] for idx in I[0] if idx < len(st.session_state.chunks)])
+                try:
+                    # CHANGED: timeout=None allows slow laptops to load the model without crashing
+                    res = httpx.post(
+                        "http://localhost:11434/api/generate", 
+                        json={"model": "llama3.2:1b", "prompt": f"Context:\n{retrieved_context}\n\nQuery: {user_query}", "stream": False}, 
+                        timeout=None
+                    )
+                    ai_res = res.json().get("response", "Error.")
+                    st.markdown(ai_res)
+                    st.session_state.messages.append({"role": "assistant", "content": ai_res})
+                except Exception as e: 
+                    st.error(f"Ollama error: {e}. Trying to download ultra-lightweight model...")
