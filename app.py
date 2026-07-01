@@ -1,88 +1,117 @@
 import streamlit as st
-import os
 import pymupdf4llm
+import os
+import numpy as np
+import faiss
 import ollama
+from sentence_transformers import SentenceTransformer
 
-st.set_page_config(page_title="Mozilla Blueprint RAG", layout="centered")
-st.title("📚 Structural Markdown-Based Chatbot")
-st.write("A lightweight, vector-free implementation based on the Mozilla.ai RAG Blueprint.")
+# Set page configuration for a professional wide layout
+st.set_page_config(page_title="Mozilla RAG Dashboard", layout="wide")
 
-# Target Directory
 UPLOAD_DIR = "uploaded_docs"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
 
-# File Uploader
-uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+embedding_model = load_embedding_model()
+
+def chunk_text(text, chunk_size=1000, chunk_overlap=200):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - chunk_overlap
+    return chunks
+
+# --- SIDEBAR DESIGN ---
+st.sidebar.title("??? Control Panel")
+st.sidebar.markdown("Use this panel to manage your input documents and monitor pipeline metrics.")
+uploaded_file = st.sidebar.file_uploader("Upload a PDF document:", type=["pdf"])
+
+if "document_chunks" not in st.session_state:
+    st.session_state["document_chunks"] = None
+if "faiss_index" not in st.session_state:
+    st.session_state["faiss_index"] = None
 
 if uploaded_file is not None:
     file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.success(f"Saved {uploaded_file.name} successfully!")
-
-    # 1. Structural Extraction (No Vector Database / Embeddings)
-    with st.spinner("Extracting layout boundaries via PyMuPDF4LLM..."):
-        md_text = pymupdf4llm.to_markdown(file_path)
+    
+    if st.session_state["faiss_index"] is None:
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.read())
         
-        # Parse Markdown headers into discrete semantic components
-        sections = {}
-        current_heading = "Overview"
-        current_content = []
-        
-        for line in md_text.split("\n"):
-            if line.strip().startswith(("# ", "## ", "### ")):
-                if current_content:
-                    sections[current_heading] = "\n".join(current_content).strip()
-                current_heading = line.replace("#", "").strip()
-                current_content = [line]
-            else:
-                current_content.append(line)
-        if current_content:
-            sections[current_heading] = "\n".join(current_content).strip()
-            
-    st.info(f"Document segmented into {len(sections)} layout sections!")
+        with st.sidebar.spinner("Processing Document..."):
+            try:
+                md_text = pymupdf4llm.to_markdown(file_path)
+                chunks = chunk_text(md_text)
+                
+                embeddings = embedding_model.encode(chunks)
+                embeddings_array = np.array(embeddings).astype('float32')
+                
+                dimension = embeddings_array.shape[1]
+                index = faiss.IndexFlatL2(dimension)
+                index.add(embeddings_array)
+                
+                st.session_state["document_chunks"] = chunks
+                st.session_state["faiss_index"] = index
+                st.session_state["md_text_len"] = len(md_text)
+                
+            except Exception as e:
+                st.sidebar.error(f"Error parsing file: {e}")
 
-    # Chat UI
-    user_query = st.text_input("Ask a question about the document:")
+# --- MAIN SCREEN DESIGN ---
+st.title("?? Mozilla Lightweight RAG Application")
+st.subheader("Final Year Project Dashboard")
+st.markdown("This intelligent assistant parses local documents, creates dense vector representations, and handles semantic retrieval using an entirely offline pipeline.")
+
+if st.session_state["faiss_index"] is not None:
+    st.sidebar.success(f"Active File: {uploaded_file.name}")
+    
+    # Render Metrics cleanly inside the Sidebar
+    st.sidebar.markdown("### ?? Pipeline Metrics")
+    st.sidebar.metric("Characters Extracted", st.session_state["md_text_len"])
+    st.sidebar.metric("Total Vector Chunks", len(st.session_state["document_chunks"]))
+    st.sidebar.metric("FAISS Index Database", "Online / Ready")
+    
+    # Main Chat Interface
+    st.markdown("---")
+    st.markdown("### ?? Ask Questions to your Document")
+    user_query = st.text_input("Type your question below and press Enter:", placeholder="e.g., What are the core skills or projects listed?")
     
     if user_query:
-        with st.spinner("Routing query to the correct document layout section..."):
-            # 2. Roaming RAG Router Pattern
-            titles_list = "\n".join([f"- {title}" for title in sections.keys()])
-            router_prompt = (
-                f"Select the single most relevant section title from this list that contains "
-                f"the answer to the user's question.\n\nList:\n{titles_list}\n\nQuestion: {user_query}\n\n"
-                f"Respond ONLY with the exact chosen title name."
-            )
+        with st.spinner("Analyzing semantic vectors and generating response..."):
+            query_vector = embedding_model.encode([user_query]).astype('float32')
+            distances, indices = st.session_state["faiss_index"].search(query_vector, k=1)
+            matched_index = indices[0][0]
+            retrieved_chunk = st.session_state["document_chunks"][matched_index]
             
-            route_res = ollama.chat(
-                model="qwen2.5:0.5b",
-                messages=[{"role": "user", "content": router_prompt}],
-                options={"temperature": 0.0}
-            )
-            chosen_title = route_res['message']['content'].strip()
+            prompt_context = f"""
+            You are a helpful AI assistant. Answer the user's question accurately using ONLY the provided document context.
+            If the answer cannot be found in the context, politely say you don't know.
             
-            # Fallback evaluation matcher
-            if chosen_title not in sections:
-                matched = [t for t in sections.keys() if t.lower() in chosen_title.lower()]
-                chosen_title = matched[0] if matched else list(sections.keys())[0]
+            Context:
+            {retrieved_chunk}
+            
+            Question: {user_query}
+            Answer:
+            """
+            
+            try:
+                response = ollama.generate(model="phi3", prompt=prompt_context)
                 
-            st.caption(f"📍 Content pulled exclusively from section: **{chosen_title}**")
-            
-        with st.spinner("Formulating localized answer..."):
-            # 3. Targeted Context Processing
-            context_block = sections[chosen_title]
-            qa_prompt = (
-                f"Answer the question strictly using this context block. If it doesn't contain the answer, "
-                f"say 'Information not found.'\n\nContext:\n{context_block}\n\nQuestion: {user_query}"
-            )
-            
-            ans_res = ollama.chat(
-                model="qwen2.5:0.5b",
-                messages=[{"role": "user", "content": qa_prompt}],
-                options={"temperature": 0.2}
-            )
-            
-            st.write("### Answer:")
-            st.write(ans_res['message']['content'].strip())
+                # Display nicely formatted response block
+                st.markdown("#### ?? AI Response")
+                st.info(response['response'])
+                
+                with st.expander("?? View Retrieved Source Context"):
+                    st.caption(f"Source Document Segment ID: {matched_index}")
+                    st.code(retrieved_chunk, language="markdown")
+            except Exception as ollama_error:
+                st.error(f"Could not connect to Ollama. Verify model 'phi3' is running via terminal! Error: {ollama_error}")
+else:
+    st.info("?? Please upload a PDF document in the left control panel to activate the RAG AI engine.")
