@@ -1,7 +1,7 @@
 import subprocess
 import sys
 
-# 1. Force install missing dependencies on the Streamlit Cloud server
+# 1. Force install missing dependencies on the Streamlit Cloud server safely
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except ModuleNotFoundError:
@@ -40,7 +40,7 @@ except Exception as e:
     st.sidebar.warning("Could not connect to a local Ollama instance. Ensure Ollama is running.")
 
 # 4. File Upload Section
-uploaded_file = st.file_file_uploader("Upload your target PDF document", type=["pdf"])
+uploaded_file = st.file_uploader("Upload your target PDF document", type=["pdf"])
 
 if uploaded_file is not None:
     # Save the uploaded file temporarily
