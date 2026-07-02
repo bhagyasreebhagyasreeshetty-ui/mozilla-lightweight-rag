@@ -1,95 +1,96 @@
+import subprocess
+import sys
+
+# 1. Force install missing dependencies on the Streamlit Cloud server
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ModuleNotFoundError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "langchain-text-splitters", "langchain"])
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 import streamlit as st
-import httpx
+import os
 import pymupdf4llm
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+from llama_index.core import VectorStoreIndex, StorageContext, Document
+from llama_index.vector_stores.faiss import FaissVectorStore
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.llms.ollama import Ollama
+import faiss
 
-# Set up the Streamlit Page Layout
-st.set_page_config(page_title="Local Resume RAG AI", layout="centered")
-st.title("📄 Local Resume RAG Assistant")
-st.write("Ask questions about your uploaded resume completely offline.")
+# 2. Configure Streamlit Page Settings
+st.set_page_config(page_title="Mozilla Lightweight RAG App", layout="centered")
+st.title("🦙 Mozilla Lightweight RAG Application")
+st.write("Upload a PDF document to parse it and ask questions using your local/cloud LLM environment.")
 
-# 1. Initialize the Embedding Model (Cached so it stays fast)
+# 3. Sidebar Configuration for Models
+st.sidebar.header("Configuration")
+llm_model = st.sidebar.selectbox("Select LLM Model", ["llama3", "mistral", "phi3"], index=0)
+embed_model_name = st.sidebar.selectbox("Select Embedding Model", ["nomic-embed-text", "bge-small-en"], index=0)
+
+# Initialize Ollama LLM & Embedding models
 @st.cache_resource
-def load_embeddings():
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+def init_models(llm_name, embed_name):
+    llm = Ollama(model=llm_name, request_timeout=60.0)
+    embed_model = OllamaEmbedding(model_name=embed_name)
+    return llm, embed_model
 
-embeddings = load_embeddings()
+try:
+    llm, embed_model = init_models(llm_model, embed_model_name)
+except Exception as e:
+    st.sidebar.warning("Could not connect to a local Ollama instance. Ensure Ollama is running.")
 
-# Initialize Chat History
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# 4. File Upload Section
+uploaded_file = st.file_file_uploader("Upload your target PDF document", type=["pdf"])
 
-# Sidebar for Document Upload
-with st.sidebar:
-    st.header("Upload Document")
-    uploaded_file = st.file_uploader("Upload your Resume (PDF)", type=["pdf"])
-
-# 2. Process the PDF and Create Vector Store if Uploaded
-vector_store = None
 if uploaded_file is not None:
-    # Save uploaded file temporarily to read it
-    with open("temp_resume.pdf", "wb") as f:
+    # Save the uploaded file temporarily
+    temp_dir = "temp_docs"
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+        
+    file_path = os.path.join(temp_dir, uploaded_file.name)
+    with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
-    
-    with st.spinner("Parsing PDF and indexing sections..."):
+        
+    st.success(f"Saved {uploaded_file.name} successfully!")
+
+    # 5. Process & Indexing Pipeline
+    with st.spinner("Parsing PDF and building vector index..."):
         try:
-            # Extract clean markdown text from PDF
-            md_text = pymupdf4llm.to_markdown("temp_resume.pdf")
+            # Step A: Parse PDF to Markdown layout text using PyMuPDF4LLM
+            md_text = pymupdf4llm.to_markdown(file_path)
             
-            # Split text into manageable chunks
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            # Step B: Chunk the text beautifully using the recursive character splitter
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             chunks = text_splitter.split_text(md_text)
             
-            # Build the FAISS Vector Database locally
-            vector_store = FAISS.from_texts(chunks, embeddings)
-            st.sidebar.success("Resume processed successfully!")
+            # Step C: Convert chunks to LlamaIndex Documents
+            documents = [Document(text=chunk) for chunk in chunks]
+            
+            # Step D: Construct a FAISS Vector Index
+            d = 4096 if "nomic" in embed_model_name else 384  # Adjust dimensions based on model choice
+            faiss_index = faiss.IndexFlatL2(d)
+            vector_store = FaissVectorStore(faiss_index=faiss_index)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            
+            # Step E: Build the index
+            index = VectorStoreIndex.from_documents(
+                documents, 
+                storage_context=storage_context, 
+                embed_model=embed_model
+            )
+            st.success("Indexing completed! Your document is ready for queries.")
+            
+            # 6. Query Interface
+            st.write("---")
+            st.subheader("Ask questions about your document")
+            query_engine = index.as_query_engine(llm=llm)
+            
+            user_query = st.text_input("Enter your question here:")
+            if user_query:
+                with st.spinner("Thinking..."):
+                    response = query_engine.query(user_query)
+                    st.markdown(f"**Answer:** {response}")
+                    
         except Exception as e:
-            st.sidebar.error(f"Error parsing PDF: {e}")
-
-# 3. Display Existing Chat Messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# 4. Handle User Input
-if user_query := st.chat_input("Ask something about the resume..."):
-    # Display the user's question instantly
-    st.session_state.messages.append({"role": "user", "content": user_query})
-    with st.chat_message("user"):
-        st.markdown(user_query)
-
-    # Generate Response using RAG
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            if vector_store is None:
-                ai_res = "Please upload a resume in the sidebar first before asking questions!"
-                st.markdown(ai_res)
-                st.session_state.messages.append({"role": "assistant", "content": ai_res})
-            else:
-                try:
-                    # Retrieve the top 3 most relevant chunks from FAISS
-                    docs = vector_store.similarity_search(user_query, k=3)
-                    retrieved_context = "\n---\n".join([doc.page_content for doc in docs])
-                    
-                    # Create the payload exactly with streaming disabled
-                    payload = {
-                        "model": "llama3.2:1b",
-                        "prompt": f"Context:\n{retrieved_context}\n\nQuery: {user_query}\n\nAnswer the query clearly based ONLY on the context provided above.",
-                        "stream": False  # <--- Fixes the infinite loading bug!
-                    }
-                    
-                    # Send request to local Ollama API endpoint
-                    res = httpx.post("http://localhost:11434/api/generate", json=payload, timeout=None)
-                    
-                    # Extract the fully built message response from Ollama
-                    ai_res = res.json()["response"]
-                    
-                    st.markdown(ai_res)
-                    st.session_state.messages.append({"role": "assistant", "content": ai_res})
-                    
-                except Exception as e:
-                    error_msg = f"Error connecting to Ollama: {e}. Please ensure Ollama is running."
-                    st.markdown(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            st.error(f"An error occurred during pipeline execution: {e}")
